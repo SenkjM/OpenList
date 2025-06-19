@@ -15,7 +15,7 @@ import (
 	"github.com/OpenListTeam/OpenList/internal/model"
 	"github.com/OpenListTeam/OpenList/internal/op"
 	"github.com/OpenListTeam/OpenList/pkg/utils"
-	sdk "github.com/OpenListTeam/115-sdk-go"
+	sdk "github.com/SenkjM/115-sdk-go"
 	"golang.org/x/time/rate"
 )
 
