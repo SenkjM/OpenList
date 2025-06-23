@@ -1,0 +1,66 @@
+name: Build All Platforms
+
+on:
+  workflow_dispatch:
+    inputs:
+      build-type:
+        description: 'Build type (dev, beta, or leave blank for release)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    name: Build on Ubuntu
+    runs-on: ubuntu-latest
+
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GO111MODULE: on
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Setup dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl upx wget tar unzip build-essential clang xz-utils
+
+      - name: Cache Go Modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: Make build.sh executable
+        run: chmod +x ./build.sh
+
+      - name: Run build script
+        run: |
+          if [[ "${{ github.event.inputs.build-type }}" == "dev" ]]; then
+            ./build.sh dev
+          elif [[ "${{ github.event.inputs.build-type }}" == "beta" ]]; then
+            ./build.sh beta
+          else
+            ./build.sh
+          fi
+
+      - name: Archive release files
+        if: success()
+        run: |
+          mkdir -p artifacts
+          cp -r build/compress/* artifacts/ || true
+
+      - name: Upload Artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: artifacts
