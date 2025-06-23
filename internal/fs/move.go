@@ -25,6 +25,7 @@ type MoveTask struct {
 	dstStorage   driver.Driver `json:"-"`
 	SrcStorageMp string        `json:"src_storage_mp"`
 	DstStorageMp string        `json:"dst_storage_mp"`
+	doneChan     chan error    `json:"-"` // 子任务完成同步
 }
 
 func (t *MoveTask) GetName() string {
@@ -40,6 +41,7 @@ func (t *MoveTask) Run() error {
 	t.ClearEndTime()
 	t.SetStartTime(time.Now())
 	defer func() { t.SetEndTime(time.Now()) }()
+
 	var err error
 	if t.srcStorage == nil {
 		t.srcStorage, err = op.GetStorageByMountPath(t.SrcStorageMp)
@@ -48,10 +50,18 @@ func (t *MoveTask) Run() error {
 		t.dstStorage, err = op.GetStorageByMountPath(t.DstStorageMp)
 	}
 	if err != nil {
+		if t.doneChan != nil {
+			t.doneChan <- err
+		}
 		return errors.WithMessage(err, "failed get storage")
 	}
 
-	return moveBetween2Storages(t, t.srcStorage, t.dstStorage, t.SrcObjPath, t.DstDirPath)
+	err = moveBetween2Storages(t, t.srcStorage, t.dstStorage, t.SrcObjPath, t.DstDirPath)
+
+	if t.doneChan != nil {
+		t.doneChan <- err // 通知等待者
+	}
+	return err
 }
 
 var MoveTaskManager *tache.Manager[*MoveTask]
@@ -63,31 +73,32 @@ func moveBetween2Storages(t *MoveTask, srcStorage, dstStorage driver.Driver, src
 	if err != nil {
 		return errors.WithMessagef(err, "failed get src [%s] file", srcObjPath)
 	}
-	
+
 	if srcObj.IsDir() {
 		t.Status = "src object is dir, listing objs"
 		objs, err := op.List(t.Ctx(), srcStorage, srcObjPath, model.ListArgs{})
 		if err != nil {
 			return errors.WithMessagef(err, "failed list src [%s] objs", srcObjPath)
 		}
-		
+
 		dstObjPath := stdpath.Join(dstDirPath, srcObj.GetName())
 		t.Status = "creating destination directory"
 		err = op.MakeDir(t.Ctx(), dstStorage, dstObjPath)
 		if err != nil {
-			// Check if this is an upload-related error and provide a clearer message
 			if errors.Is(err, errs.UploadNotSupported) {
 				return errors.WithMessagef(err, "destination storage [%s] does not support creating directories", dstStorage.GetStorage().MountPath)
 			}
 			return errors.WithMessagef(err, "failed to create destination directory [%s] in storage [%s]", dstObjPath, dstStorage.GetStorage().MountPath)
 		}
-		
+
+		var subTasks []*MoveTask
 		for _, obj := range objs {
 			if utils.IsCanceled(t.Ctx()) {
 				return nil
 			}
 			srcSubObjPath := stdpath.Join(srcObjPath, obj.GetName())
-			MoveTaskManager.Add(&MoveTask{
+
+			subTask := &MoveTask{
 				TaskExtension: task.TaskExtension{
 					Creator: t.GetCreator(),
 				},
@@ -97,7 +108,19 @@ func moveBetween2Storages(t *MoveTask, srcStorage, dstStorage driver.Driver, src
 				DstDirPath:   dstObjPath,
 				SrcStorageMp: srcStorage.GetStorage().MountPath,
 				DstStorageMp: dstStorage.GetStorage().MountPath,
-			})
+				doneChan:     make(chan error, 1), // 用于同步
+			}
+
+			subTasks = append(subTasks, subTask)
+			MoveTaskManager.Add(subTask)
+		}
+
+		t.Status = "waiting for sub-tasks"
+		for _, subTask := range subTasks {
+			err := <-subTask.doneChan
+			if err != nil {
+				return errors.WithMessagef(err, "sub-task failed for [%s]", subTask.SrcObjPath)
+			}
 		}
 
 		t.Status = "cleaning up source directory"
@@ -108,9 +131,9 @@ func moveBetween2Storages(t *MoveTask, srcStorage, dstStorage driver.Driver, src
 			t.Status = "completed"
 		}
 		return nil
-	} else {
-		return moveFileBetween2Storages(t, srcStorage, dstStorage, srcObjPath, dstDirPath)
 	}
+
+	return moveFileBetween2Storages(t, srcStorage, dstStorage, srcObjPath, dstDirPath)
 }
 
 
