@@ -26,25 +26,25 @@ OpenList is een open-source project dat onafhankelijk wordt onderhouden door het
 
 We hebben gemerkt dat er in de gemeenschap enkele derde partij projecten zijn verschenen met namen vergelijkbaar met dit project, zoals OpenListApp/OpenListApp, evenals enkele betaalde eigendomssoftware die dezelfde of soortgelijke naamgeving gebruikt. Om verwarring bij gebruikers te voorkomen, verklaren we hierbij:
 
-- 1 OpenList heeft geen officiële associatie met enige derde partij afgeleide projecten.
+- OpenList heeft geen officiële associatie met enige derde partij afgeleide projecten.
 
-- 2 Alle software, code en diensten van dit project worden onderhouden door het OpenList Team en zijn gratis beschikbaar op GitHub.
+- Alle software, code en diensten van dit project worden onderhouden door het OpenList Team en zijn gratis beschikbaar op GitHub.
 
-- 3 Projectdocumentatie en API diensten zijn voornamelijk afhankelijk van liefdadigheidsbronnen verstrekt door Cloudflare. Er zijn momenteel geen betaalplannen of commerciële implementaties, en het gebruik van bestaande functies brengt geen kosten met zich mee.
+- Projectdocumentatie en API diensten zijn voornamelijk afhankelijk van liefdadigheidsbronnen verstrekt door Cloudflare. Er zijn momenteel geen betaalplannen of commerciële implementaties, en het gebruik van bestaande functies brengt geen kosten met zich mee.
 
 We respecteren de rechten van de gemeenschap voor vrij gebruik en afgeleide ontwikkeling, maar we roepen downstream projecten ook ten zeerste op:
 
-- 1 Mogen niet de "OpenList" naam gebruiken voor namaakpromotie of commercieel gewin;
+- Mogen niet de "OpenList" naam gebruiken voor namaakpromotie of commercieel gewin;
 
-- 2 Mogen OpenList-gebaseerde code niet distribueren op een closed-source manier of AGPL licentievoorwaarden schenden.
+- Mogen OpenList-gebaseerde code niet distribueren op een closed-source manier of AGPL licentievoorwaarden schenden.
 
 Om een gezonde ecosysteemontwikkeling beter te onderhouden, bevelen we aan:
 
-- 1 Duidelijk de projectbron aangeven en passende open-source licenties kiezen in overeenstemming met de open-source geest;
+- Duidelijk de projectbron aangeven en passende open-source licenties kiezen in overeenstemming met de open-source geest;
 
-- 2 Bij commercieel gebruik, vermijd het gebruik van "OpenList" of enige verwarrende naamgeving als projectnaam;
+- Bij commercieel gebruik, vermijd het gebruik van "OpenList" of enige verwarrende naamgeving als projectnaam;
 
-- 3 Als u materialen onder OpenListTeam/Logo moet gebruiken, kunt u deze wijzigen en gebruiken onder naleving van de overeenkomst.
+- Als u materialen onder OpenListTeam/Logo moet gebruiken, kunt u deze wijzigen en gebruiken onder naleving van de overeenkomst.
 
 Dank u voor uw ondersteuning en begrip
 
