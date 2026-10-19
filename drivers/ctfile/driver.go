@@ -170,7 +170,7 @@ func (d *CtFile) Put(ctx context.Context, dstDir model.Obj, file model.FileStrea
 
 	if len(md5hex) != utils.MD5.Width {
 		// Cache the full stream and compute MD5 simultaneously.
-		tmpFile, hash, err := stream.CacheFullInTempFileAndHash(file, up, utils.MD5)
+		tmpFile, hash, err := stream.CacheFullAndHash(file, &up, utils.MD5)
 		if err != nil {
 			return err
 		}
