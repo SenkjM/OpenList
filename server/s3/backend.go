@@ -14,14 +14,16 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
-	"github.com/itsHenry35/gofakes3"
+	"github.com/OpenListTeam/gofakes3"
 	"github.com/ncw/swift/v2"
 	log "github.com/sirupsen/logrus"
 )
@@ -31,17 +33,25 @@ var (
 	timeFormat  = "Mon, 2 Jan 2006 15:04:05 GMT"
 )
 
-// s3Backend implements the gofacess3.Backend interface to make an S3
-// backend for gofakes3
+// s3Backend implements the gofakes3.Backend interface to make an S3
+// backend for gofakes3. It also implements gofakes3.MultipartBackend so that
+// multipart uploads are streamed to local temp files part-by-part and
+// assembled into storage on completion, instead of being buffered in memory.
 type s3Backend struct {
-	meta *sync.Map
+	meta    *sync.Map
+	listDir func(context.Context, string) ([]model.Obj, error)
+	uploads *sync.Map // map[gofakes3.UploadID]*multipartState
 }
 
 // newBackend creates a new SimpleBucketBackend.
 func newBackend() gofakes3.Backend {
-	return &s3Backend{
-		meta: new(sync.Map),
+	b := &s3Backend{
+		meta:    new(sync.Map),
+		uploads: new(sync.Map),
+		listDir: getDirEntries,
 	}
+	b.startReaper()
+	return b
 }
 
 // ListBuckets always returns the default bucket.
@@ -82,10 +92,9 @@ func (b *s3Backend) ListBucket(ctx context.Context, bucketName string, prefix *g
 		prefix.HasDelimiter = false
 	}
 
-	response := gofakes3.NewObjectList()
 	path, remaining := prefixParser(prefix)
 
-	err = b.entryListR(bucketPath, path, remaining, prefix.HasDelimiter, response)
+	response, err := b.listPage(ctx, bucketPath, path, remaining, prefix.HasDelimiter, page)
 	if err == gofakes3.ErrNoSuchKey {
 		// AWS just returns an empty list
 		response = gofakes3.NewObjectList()
@@ -93,7 +102,7 @@ func (b *s3Backend) ListBucket(ctx context.Context, bucketName string, prefix *g
 		return nil, err
 	}
 
-	return b.pager(response, page)
+	return response, nil
 }
 
 // HeadObject returns the fileinfo for the given object name.
@@ -108,7 +117,7 @@ func (b *s3Backend) HeadObject(ctx context.Context, bucketName, objectName strin
 
 	fp := path.Join(bucketPath, objectName)
 	fmeta, _ := op.GetNearestMeta(fp)
-	node, err := fs.Get(context.WithValue(ctx, "meta", fmeta), fp, &fs.GetArgs{})
+	node, err := fs.Get(context.WithValue(ctx, conf.MetaKey, fmeta), fp, &fs.GetArgs{})
 	if err != nil {
 		return nil, gofakes3.KeyNotFound(objectName)
 	}
@@ -143,6 +152,8 @@ func (b *s3Backend) HeadObject(ctx context.Context, bucketName, objectName strin
 
 // GetObject fetchs the object from the filesystem.
 func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string, rangeRequest *gofakes3.ObjectRangeRequest) (s3Obj *gofakes3.Object, err error) {
+	defer func() { err = mapBackendError(err) }()
+
 	bucket, err := getBucketByName(bucketName)
 	if err != nil {
 		return nil, err
@@ -151,7 +162,7 @@ func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string
 
 	fp := path.Join(bucketPath, objectName)
 	fmeta, _ := op.GetNearestMeta(fp)
-	node, err := fs.Get(context.WithValue(ctx, "meta", fmeta), fp, &fs.GetArgs{})
+	node, err := fs.Get(context.WithValue(ctx, conf.MetaKey, fmeta), fp, &fs.GetArgs{})
 	if err != nil {
 		return nil, gofakes3.KeyNotFound(objectName)
 	}
@@ -170,7 +181,10 @@ func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string
 		}
 	}()
 
-	size := file.GetSize()
+	size := link.ContentLength
+	if size <= 0 {
+		size = file.GetSize()
+	}
 	rnge, err := rangeRequest.Range(size)
 	if err != nil {
 		return nil, err
@@ -181,7 +195,7 @@ func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string
 		return nil, fmt.Errorf("the remote storage driver need to be enhanced to support s3")
 	}
 
-	var rd io.Reader
+	var rd io.ReadCloser
 	if rnge != nil {
 		rd, err = rrf.RangeRead(ctx, http_range.Range(*rnge))
 	} else {
@@ -203,6 +217,7 @@ func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string
 			meta[k] = v
 		}
 	}
+	closers := utils.NewClosers(rd, link)
 
 	return &gofakes3.Object{
 		// Name: gofakes3.URLEncode(objectName),
@@ -211,7 +226,7 @@ func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string
 		Metadata: meta,
 		Size:     size,
 		Range:    rnge,
-		Contents: utils.ReadCloser{Reader: rd, Closer: link},
+		Contents: utils.ReadCloser{Reader: rd, Closer: &closers},
 	}, nil
 }
 
@@ -227,9 +242,20 @@ func (b *s3Backend) PutObject(
 	meta map[string]string,
 	input io.Reader, size int64,
 ) (result gofakes3.PutObjectResult, err error) {
+	return result, b.putStream(ctx, bucketName, objectName, meta, input, size)
+}
+
+// putStream stores the given object into the underlying storage. It is shared
+// by PutObject and the multipart-upload Complete step so both paths apply the
+// same directory creation, metadata and ignore rules.
+func (b *s3Backend) putStream(
+	ctx context.Context, bucketName, objectName string,
+	meta map[string]string,
+	input io.Reader, size int64,
+) error {
 	bucket, err := getBucketByName(bucketName)
 	if err != nil {
-		return result, err
+		return err
 	}
 	bucketPath := bucket.Path
 
@@ -247,23 +273,23 @@ func (b *s3Backend) PutObject(
 	}
 	log.Debugf("reqPath: %s", reqPath)
 	fmeta, _ := op.GetNearestMeta(fp)
-	ctx = context.WithValue(ctx, "meta", fmeta)
+	ctx = context.WithValue(ctx, conf.MetaKey, fmeta)
 
 	_, err = fs.Get(ctx, reqPath, &fs.GetArgs{})
 	if err != nil {
 		if errs.IsObjectNotFound(err) && strings.Contains(objectName, "/") {
 			log.Debugf("reqPath: %s not found and objectName contains /, need to makeDir", reqPath)
-			err = fs.MakeDir(ctx, reqPath, true)
+			err = fs.MakeDir(ctx, reqPath)
 			if err != nil {
-				return result, errors.WithMessagef(err, "failed to makeDir, reqPath: %s", reqPath)
+				return errors.WithMessagef(err, "failed to makeDir, reqPath: %s", reqPath)
 			}
 		} else {
-			return result, gofakes3.KeyNotFound(objectName)
+			return gofakes3.KeyNotFound(objectName)
 		}
 	}
 
 	if isDir {
-		return result, nil
+		return nil
 	}
 
 	var ti time.Time
@@ -276,32 +302,38 @@ func (b *s3Backend) PutObject(
 		ti, _ = swift.FloatStringToTime(val)
 	}
 
+	// If Modified is not set, use current time
+	if ti.IsZero() {
+		ti = time.Now()
+	}
+
 	obj := model.Object{
 		Name:     path.Base(fp),
 		Size:     size,
 		Modified: ti,
 		Ctime:    time.Now(),
 	}
+	// Check if system file should be ignored
+	if setting.GetBool(conf.IgnoreSystemFiles) && utils.IsSystemFile(obj.Name) {
+		return errs.IgnoredSystemFile
+	}
 	stream := &stream.FileStream{
 		Obj:      &obj,
 		Reader:   input,
 		Mimetype: meta["Content-Type"],
 	}
+	if stream.Mimetype == "" {
+		stream.Mimetype = "application/octet-stream"
+	}
 
 	err = fs.PutDirectly(ctx, reqPath, stream)
 	if err != nil {
-		return result, err
+		return err
 	}
-
-	// if err := stream.Close(); err != nil {
-	// 	// remove file when close error occurred (FsPutErr)
-	// 	_ = fs.Remove(ctx, fp)
-	// 	return result, err
-	// }
 
 	b.meta.Store(fp, meta)
 
-	return result, nil
+	return nil
 }
 
 // DeleteMulti deletes multiple objects in a single request.
@@ -341,7 +373,7 @@ func (b *s3Backend) deleteObject(ctx context.Context, bucketName, objectName str
 	fmeta, _ := op.GetNearestMeta(fp)
 	// S3 does not report an error when attemping to delete a key that does not exist, so
 	// we need to skip IsNotExist errors.
-	if _, err := fs.Get(context.WithValue(ctx, "meta", fmeta), fp, &fs.GetArgs{}); err != nil && !errs.IsObjectNotFound(err) {
+	if _, err := fs.Get(context.WithValue(ctx, conf.MetaKey, fmeta), fp, &fs.GetArgs{}); err != nil && !errs.IsObjectNotFound(err) {
 		return err
 	}
 
@@ -388,7 +420,7 @@ func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket
 
 	srcFp := path.Join(srcBucketPath, srcKey)
 	fmeta, _ := op.GetNearestMeta(srcFp)
-	srcNode, err := fs.Get(context.WithValue(ctx, "meta", fmeta), srcFp, &fs.GetArgs{})
+	srcNode, err := fs.Get(context.WithValue(ctx, conf.MetaKey, fmeta), srcFp, &fs.GetArgs{})
 
 	c, err := b.GetObject(ctx, srcBucket, srcKey, nil)
 	if err != nil {

@@ -1,4 +1,4 @@
-package template
+package ilanzou
 
 type ListResp struct {
 	Msg       string     `json:"msg"`
@@ -41,6 +41,18 @@ type ListItem struct {
 type Part struct {
 	PartNumber int    `json:"partNumber"`
 	ETag       string `json:"etag"`
+}
+
+type UploadTokenRapidResp struct {
+	Msg     string `json:"msg"`
+	Code    int    `json:"code"`
+	UpToken string `json:"upToken"`
+	Map     struct {
+		FileIconID int    `json:"fileIconId"`
+		FileName   string `json:"fileName"`
+		FileIcon   string `json:"fileIcon"`
+		FileID     int64  `json:"fileId"`
+	} `json:"map"`
 }
 
 type UploadResultResp struct {

@@ -7,8 +7,11 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/internal/task"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
@@ -27,6 +30,14 @@ func getLastModified(c *gin.Context) time.Time {
 	return lastModified
 }
 
+// shouldIgnoreSystemFile checks if the filename should be ignored based on settings
+func shouldIgnoreSystemFile(filename string) bool {
+	if setting.GetBool(conf.IgnoreSystemFiles) {
+		return utils.IsSystemFile(filename)
+	}
+	return false
+}
+
 func FsStream(c *gin.Context) {
 	defer func() {
 		if n, _ := io.ReadFull(c.Request.Body, []byte{0}); n == 1 {
@@ -42,27 +53,35 @@ func FsStream(c *gin.Context) {
 	}
 	asTask := c.GetHeader("As-Task") == "true"
 	overwrite := c.GetHeader("Overwrite") != "false"
-	user := c.MustGet("user").(*model.User)
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
 	path, err = user.JoinPath(path)
 	if err != nil {
 		common.ErrorResp(c, err, 403)
 		return
 	}
 	if !overwrite {
-		if res, _ := fs.Get(c, path, &fs.GetArgs{NoLog: true}); res != nil {
+		if res, _ := fs.Get(c.Request.Context(), path, &fs.GetArgs{NoLog: true}); res != nil {
 			common.ErrorStrResp(c, "file exists", 403)
 			return
 		}
 	}
 	dir, name := stdpath.Split(path)
-	sizeStr := c.GetHeader("Content-Length")
-	if sizeStr == "" {
-		sizeStr = "0"
-	}
-	size, err := strconv.ParseInt(sizeStr, 10, 64)
-	if err != nil {
-		common.ErrorResp(c, err, 400)
+	// Check if system file should be ignored
+	if shouldIgnoreSystemFile(name) {
+		common.ErrorStrResp(c, errs.IgnoredSystemFile.Error(), 403)
 		return
+	}
+	// 如果请求头 Content-Length 和 X-File-Size 都没有，则 size=-1，表示未知大小的流式上传
+	size := c.Request.ContentLength
+	if size < 0 {
+		sizeStr := c.GetHeader("X-File-Size")
+		if sizeStr != "" {
+			size, err = strconv.ParseInt(sizeStr, 10, 64)
+			if err != nil {
+				common.ErrorResp(c, err, 400)
+				return
+			}
+		}
 	}
 	h := make(map[*utils.HashType]string)
 	if md5 := c.GetHeader("X-File-Md5"); md5 != "" {
@@ -91,9 +110,9 @@ func FsStream(c *gin.Context) {
 	}
 	var t task.TaskExtensionInfo
 	if asTask {
-		t, err = fs.PutAsTask(c, dir, s)
+		t, err = fs.PutAsTask(c.Request.Context(), dir, s)
 	} else {
-		err = fs.PutDirectly(c, dir, s, true)
+		err = fs.PutDirectly(c.Request.Context(), dir, s)
 	}
 	if err != nil {
 		common.ErrorResp(c, err, 500)
@@ -123,14 +142,14 @@ func FsForm(c *gin.Context) {
 	}
 	asTask := c.GetHeader("As-Task") == "true"
 	overwrite := c.GetHeader("Overwrite") != "false"
-	user := c.MustGet("user").(*model.User)
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
 	path, err = user.JoinPath(path)
 	if err != nil {
 		common.ErrorResp(c, err, 403)
 		return
 	}
 	if !overwrite {
-		if res, _ := fs.Get(c, path, &fs.GetArgs{NoLog: true}); res != nil {
+		if res, _ := fs.Get(c.Request.Context(), path, &fs.GetArgs{NoLog: true}); res != nil {
 			common.ErrorStrResp(c, "file exists", 403)
 			return
 		}
@@ -156,6 +175,11 @@ func FsForm(c *gin.Context) {
 	}
 	defer f.Close()
 	dir, name := stdpath.Split(path)
+	// Check if system file should be ignored
+	if shouldIgnoreSystemFile(name) {
+		common.ErrorStrResp(c, errs.IgnoredSystemFile.Error(), 403)
+		return
+	}
 	h := make(map[*utils.HashType]string)
 	if md5 := c.GetHeader("X-File-Md5"); md5 != "" {
 		h[utils.MD5] = md5
@@ -186,9 +210,9 @@ func FsForm(c *gin.Context) {
 		s.Reader = struct {
 			io.Reader
 		}{f}
-		t, err = fs.PutAsTask(c, dir, s)
+		t, err = fs.PutAsTask(c.Request.Context(), dir, s)
 	} else {
-		err = fs.PutDirectly(c, dir, s, true)
+		err = fs.PutDirectly(c.Request.Context(), dir, s)
 	}
 	if err != nil {
 		common.ErrorResp(c, err, 500)

@@ -2,7 +2,6 @@ package model
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"time"
@@ -12,9 +11,11 @@ import (
 )
 
 type ListArgs struct {
-	ReqPath           string
-	S3ShowPlaceholder bool
-	Refresh           bool
+	ReqPath            string
+	S3ShowPlaceholder  bool
+	Refresh            bool
+	WithStorageDetails bool
+	SkipHook           bool
 }
 
 type LinkArgs struct {
@@ -28,22 +29,31 @@ type Link struct {
 	URL         string        `json:"url"`    // most common way
 	Header      http.Header   `json:"header"` // needed header (for url)
 	RangeReader RangeReaderIF `json:"-"`      // recommended way if can't use URL
-	MFile       File          `json:"-"`      // best for local,smb... file system, which exposes MFile
 
-	Expiration *time.Duration // local cache expire Duration
+	Expiration *time.Duration // local cache expiration; not transferred by Clone
 
 	//for accelerating request, use multi-thread downloading
-	Concurrency int `json:"concurrency"`
-	PartSize    int `json:"part_size"`
+	Concurrency   int   `json:"concurrency"`
+	PartSize      int   `json:"part_size"`
+	ContentLength int64 `json:"content_length"` // 转码视频、缩略图
 
 	utils.SyncClosers `json:"-"`
+	// 如果SyncClosers中的资源被关闭后Link将不可用，则此值应为 true
+	RequireReference bool `json:"-"`
 }
 
-func (l *Link) Close() error {
-	if clr, ok := l.MFile.(io.Closer); ok {
-		return errors.Join(clr.Close(), l.SyncClosers.Close())
+// Clone transfers ownership of l without inheriting its cache expiration.
+func (l *Link) Clone() *Link {
+	return &Link{
+		URL:              l.URL,
+		Header:           l.Header,
+		RangeReader:      l.RangeReader,
+		Concurrency:      l.Concurrency,
+		PartSize:         l.PartSize,
+		ContentLength:    l.ContentLength,
+		SyncClosers:      utils.NewSyncClosers(l),
+		RequireReference: l.RequireReference,
 	}
-	return l.SyncClosers.Close()
 }
 
 type OtherArgs struct {
@@ -82,26 +92,29 @@ type ArchiveDecompressArgs struct {
 	ArchiveInnerArgs
 	CacheFull     bool
 	PutIntoNewDir bool
+	Overwrite     bool
+}
+
+type SharingListArgs struct {
+	Refresh bool
+	Pwd     string
+}
+
+type SharingArchiveMetaArgs struct {
+	ArchiveMetaArgs
+	Pwd string
+}
+
+type SharingArchiveListArgs struct {
+	ArchiveListArgs
+	Pwd string
+}
+
+type SharingLinkArgs struct {
+	Pwd string
+	LinkArgs
 }
 
 type RangeReaderIF interface {
 	RangeRead(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error)
-}
-
-type RangeReadCloserIF interface {
-	RangeReaderIF
-	utils.ClosersIF
-}
-
-var _ RangeReadCloserIF = (*RangeReadCloser)(nil)
-
-type RangeReadCloser struct {
-	RangeReader RangeReaderIF
-	utils.Closers
-}
-
-func (r *RangeReadCloser) RangeRead(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
-	rc, err := r.RangeReader.RangeRead(ctx, httpRange)
-	r.Add(rc)
-	return rc, err
 }

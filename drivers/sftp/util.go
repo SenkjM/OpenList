@@ -3,6 +3,7 @@ package sftp
 import (
 	"fmt"
 	"path"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/pkg/singleflight"
 	"github.com/pkg/sftp"
@@ -13,8 +14,8 @@ import (
 // do others that not defined in Driver interface
 
 func (d *SFTP) initClient() error {
-	err, _, _ := singleflight.ErrorGroup.Do(fmt.Sprintf("SFTP.initClient:%p", d), func() (error, error) {
-		return d._initClient(), nil
+	_, err, _ := singleflight.AnyGroup.Do(fmt.Sprintf("SFTP.initClient:%p", d), func() (any, error) {
+		return nil, d._initClient()
 	})
 	return err
 }
@@ -39,6 +40,7 @@ func (d *SFTP) _initClient() error {
 		User:            d.Username,
 		Auth:            []ssh.AuthMethod{auth},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         10 * time.Second,
 	}
 	conn, err := ssh.Dial("tcp", d.Address, config)
 	if err != nil {

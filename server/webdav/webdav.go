@@ -7,23 +7,26 @@ package webdav // import "golang.org/x/net/webdav"
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/net"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/pkg/errors"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
-	"github.com/OpenListTeam/OpenList/v4/internal/sign"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 )
@@ -195,10 +198,10 @@ func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request) (status 
 		return status, err
 	}
 	ctx := r.Context()
-	user := ctx.Value("user").(*model.User)
+	user := ctx.Value(conf.UserKey).(*model.User)
 	reqPath, err = user.JoinPath(reqPath)
 	if err != nil {
-		return 403, err
+		return http.StatusForbidden, err
 	}
 	allow := "OPTIONS, LOCK, PUT, MKCOL"
 	if fi, err := fs.Get(ctx, reqPath, &fs.GetArgs{}); err == nil {
@@ -223,55 +226,66 @@ func (h *Handler) handleGetHeadPost(w http.ResponseWriter, r *http.Request) (sta
 	}
 	// TODO: check locks for read-only access??
 	ctx := r.Context()
-	user := ctx.Value("user").(*model.User)
+	user := ctx.Value(conf.UserKey).(*model.User)
+	password, _ := ctx.Value(conf.MetaPassKey).(string)
 	reqPath, err = user.JoinPath(reqPath)
 	if err != nil {
 		return http.StatusForbidden, err
+	}
+	meta, err := op.GetNearestMeta(reqPath)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		return http.StatusInternalServerError, err
+	}
+	if !common.CanAccess(user, meta, reqPath, password) {
+		return http.StatusForbidden, errs.PermissionDenied
 	}
 	fi, err := fs.Get(ctx, reqPath, &fs.GetArgs{})
 	if err != nil {
 		return http.StatusNotFound, err
 	}
-	if r.Method == http.MethodHead {
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", fi.GetSize()))
-		return http.StatusOK, nil
-	}
 	if fi.IsDir() {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Type", "httpd/unix-directory")
+			w.Header().Set("Content-Length", "0")
+			return http.StatusOK, nil
+		}
 		return http.StatusMethodNotAllowed, nil
 	}
 	// Let ServeContent determine the Content-Type header.
 	storage, _ := fs.GetStorage(reqPath, &fs.GetStoragesArgs{})
-	downProxyUrl := storage.GetStorage().DownProxyUrl
-	if storage.GetStorage().WebdavNative() || (storage.GetStorage().WebdavProxy() && downProxyUrl == "") {
-		link, _, err := fs.Link(ctx, reqPath, model.LinkArgs{Header: r.Header})
-		if err != nil {
-			return http.StatusInternalServerError, err
-		}
-		defer link.Close()
-		if storage.GetStorage().ProxyRange {
-			common.ProxyRange(ctx, link, fi.GetSize())
-		}
-		err = common.Proxy(w, r, link, fi)
-		if err != nil {
-			if statusCode, ok := errors.Unwrap(err).(net.ErrorHttpStatusCode); ok {
-				return int(statusCode), err
-			}
-			return http.StatusInternalServerError, fmt.Errorf("webdav proxy error: %+v", err)
-		}
-	} else if storage.GetStorage().WebdavProxy() && downProxyUrl != "" {
-		u := fmt.Sprintf("%s%s?sign=%s",
-			strings.Split(downProxyUrl, "\n")[0],
-			utils.EncodePath(reqPath, true),
-			sign.Sign(reqPath))
-		w.Header().Set("Cache-Control", "max-age=0, no-cache, no-store, must-revalidate")
-		http.Redirect(w, r, u, http.StatusFound)
-	} else {
+	if storage.GetStorage().Webdav302() {
 		link, _, err := fs.Link(ctx, reqPath, model.LinkArgs{IP: utils.ClientIP(r), Header: r.Header, Redirect: true})
 		if err != nil {
 			return http.StatusInternalServerError, err
 		}
 		defer link.Close()
 		http.Redirect(w, r, link.URL, http.StatusFound)
+		return 0, nil
+	}
+
+	if storage.GetStorage().WebdavProxyURL() {
+		if url := common.GenerateDownProxyURL(storage.GetStorage(), reqPath); url != "" {
+			w.Header().Set("Cache-Control", "max-age=0, no-cache, no-store, must-revalidate")
+			http.Redirect(w, r, url, http.StatusFound)
+			return 0, nil
+		}
+	}
+
+	link, _, err := fs.Link(ctx, reqPath, model.LinkArgs{Header: r.Header})
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	defer link.Close()
+
+	if storage.GetStorage().ProxyRange {
+		link = common.ProxyRange(ctx, link, fi.GetSize())
+	}
+	err = common.Proxy(w, r, link, fi)
+	if err != nil {
+		if statusCode, ok := errs.UnwrapOrSelf(err).(net.HttpStatusCodeError); ok {
+			return int(statusCode), err
+		}
+		return http.StatusInternalServerError, fmt.Errorf("webdav proxy error: %+v", err)
 	}
 	return 0, nil
 }
@@ -288,10 +302,13 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) (status i
 	defer release()
 
 	ctx := r.Context()
-	user := ctx.Value("user").(*model.User)
+	user := ctx.Value(conf.UserKey).(*model.User)
+	if !user.CanRemove() {
+		return http.StatusForbidden, nil
+	}
 	reqPath, err = user.JoinPath(reqPath)
 	if err != nil {
-		return 403, err
+		return http.StatusForbidden, err
 	}
 	// TODO: return MultiStatus where appropriate.
 
@@ -303,6 +320,14 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) (status i
 			return http.StatusNotFound, err
 		}
 		return http.StatusMethodNotAllowed, err
+	}
+	parentPath := path.Dir(reqPath)
+	parentMeta, err := op.GetNearestMeta(parentPath)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		return http.StatusInternalServerError, err
+	}
+	if !common.CanWrite(user, parentMeta, parentPath) {
+		return http.StatusForbidden, errs.PermissionDenied
 	}
 	if err := fs.Remove(ctx, reqPath); err != nil {
 		return http.StatusMethodNotAllowed, err
@@ -330,20 +355,67 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 		return status, err
 	}
 	defer release()
-	// TODO(rost): Support the If-Match, If-None-Match headers? See bradfitz'
-	// comments in http.checkEtag.
 	ctx := r.Context()
-	user := ctx.Value("user").(*model.User)
+	user := ctx.Value(conf.UserKey).(*model.User)
 	reqPath, err = user.JoinPath(reqPath)
 	if err != nil {
 		return http.StatusForbidden, err
 	}
+	size := r.ContentLength
+	if size < 0 {
+		sizeStr := r.Header.Get("X-File-Size")
+		if sizeStr != "" {
+			size, err = strconv.ParseInt(sizeStr, 10, 64)
+			if err != nil {
+				return http.StatusBadRequest, err
+			}
+		}
+	}
 	obj := model.Object{
 		Name:     path.Base(reqPath),
-		Size:     r.ContentLength,
+		Size:     size,
 		Modified: h.getModTime(r),
 		Ctime:    h.getCreateTime(r),
 	}
+	// Check if system file should be ignored
+	if setting.GetBool(conf.IgnoreSystemFiles) && utils.IsSystemFile(obj.Name) {
+		return http.StatusForbidden, errs.IgnoredSystemFile
+	}
+	parentPath := path.Dir(reqPath)
+	parentMeta, err := op.GetNearestMeta(parentPath)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		return http.StatusInternalServerError, err
+	}
+	if !user.CanWriteContent() && !common.CanWriteContentBypassUserPerms(parentMeta, parentPath) {
+		return http.StatusForbidden, errs.PermissionDenied
+	}
+	if !common.CanWrite(user, parentMeta, parentPath) {
+		return http.StatusForbidden, errs.PermissionDenied
+	}
+	fi, err := fs.Get(ctx, reqPath, &fs.GetArgs{})
+	exists := err == nil
+	if err != nil && !errs.IsObjectNotFound(err) {
+		if errs.IsNotFoundError(err) {
+			return http.StatusNotFound, err
+		}
+		return http.StatusInternalServerError, err
+	}
+	var modTime time.Time
+	if exists {
+		if fi.IsDir() {
+			return http.StatusMethodNotAllowed, nil
+		}
+		etag, err := findETag(ctx, h.LockSystem, reqPath, fi)
+		if err != nil {
+			return http.StatusInternalServerError, err
+		}
+		w.Header().Set("Etag", etag)
+		modTime = fi.ModTime()
+	}
+	if done, _ := net.CheckPreconditions(w, r, modTime, exists); done {
+		return 0, nil
+	}
+	w.Header().Del("Etag")
 	fsStream := &stream.FileStream{
 		Obj:      &obj,
 		Reader:   r.Body,
@@ -361,16 +433,21 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 	if err != nil {
 		return http.StatusMethodNotAllowed, err
 	}
-	fi, err := fs.Get(ctx, reqPath, &fs.GetArgs{})
+	fi, err = fs.Get(ctx, reqPath, &fs.GetArgs{})
 	if err != nil {
-		fi = &obj
+		return http.StatusInternalServerError, err
 	}
 	etag, err := findETag(ctx, h.LockSystem, reqPath, fi)
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
 	w.Header().Set("Etag", etag)
-	return http.StatusCreated, nil
+	if exists {
+		w.WriteHeader(http.StatusNoContent)
+	} else {
+		w.WriteHeader(http.StatusCreated)
+	}
+	return 0, nil
 }
 
 func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) (status int, err error) {
@@ -385,10 +462,10 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) (status in
 	defer release()
 
 	ctx := r.Context()
-	user := ctx.Value("user").(*model.User)
+	user := ctx.Value(conf.UserKey).(*model.User)
 	reqPath, err = user.JoinPath(reqPath)
 	if err != nil {
-		return 403, err
+		return http.StatusForbidden, err
 	}
 
 	if r.ContentLength > 0 {
@@ -402,12 +479,22 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) (status in
 	}
 	// RFC 4918 9.3.1
 	// 409 (Conflict) The server MUST NOT create those intermediate collections automatically.
-	reqDir := path.Dir(reqPath)
-	if _, err := fs.Get(ctx, reqDir, &fs.GetArgs{}); err != nil {
+	parentPath := path.Dir(reqPath)
+	if _, err := fs.Get(ctx, parentPath, &fs.GetArgs{}); err != nil {
 		if errs.IsObjectNotFound(err) {
 			return http.StatusConflict, err
 		}
 		return http.StatusMethodNotAllowed, err
+	}
+	parentMeta, err := op.GetNearestMeta(parentPath)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		return http.StatusInternalServerError, err
+	}
+	if !user.CanWriteContent() && !common.CanWriteContentBypassUserPerms(parentMeta, parentPath) {
+		return http.StatusForbidden, errs.PermissionDenied
+	}
+	if !common.CanWrite(user, parentMeta, parentPath) {
+		return http.StatusForbidden, errs.PermissionDenied
 	}
 	if err := fs.MakeDir(ctx, reqPath); err != nil {
 		if os.IsNotExist(err) {
@@ -449,14 +536,14 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 	}
 
 	ctx := r.Context()
-	user := ctx.Value("user").(*model.User)
+	user := ctx.Value(conf.UserKey).(*model.User)
 	src, err = user.JoinPath(src)
 	if err != nil {
-		return 403, err
+		return http.StatusForbidden, err
 	}
 	dst, err = user.JoinPath(dst)
 	if err != nil {
-		return 403, err
+		return http.StatusForbidden, err
 	}
 
 	if r.Method == "COPY" {
@@ -513,7 +600,7 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request) (retStatus 
 	}
 
 	ctx := r.Context()
-	user := ctx.Value("user").(*model.User)
+	user := ctx.Value(conf.UserKey).(*model.User)
 	token, ld, now, created := "", LockDetails{}, time.Now(), false
 	if li == (lockInfo{}) {
 		// An empty lockInfo means to refresh the lock.
@@ -553,7 +640,14 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request) (retStatus 
 		}
 		reqPath, err = user.JoinPath(reqPath)
 		if err != nil {
-			return 403, err
+			return http.StatusForbidden, err
+		}
+		meta, err := op.GetNearestMeta(reqPath)
+		if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+			return http.StatusInternalServerError, err
+		}
+		if !common.CanWrite(user, meta, reqPath) {
+			return http.StatusForbidden, errs.PermissionDenied
 		}
 		ld = LockDetails{
 			Root:      reqPath,
@@ -611,6 +705,24 @@ func (h *Handler) handleUnlock(w http.ResponseWriter, r *http.Request) (status i
 	}
 	t = t[1 : len(t)-1]
 
+	reqPath, status, err := h.stripPrefix(r.URL.Path)
+	if err != nil {
+		return status, err
+	}
+	ctx := r.Context()
+	user := ctx.Value(conf.UserKey).(*model.User)
+	reqPath, err = user.JoinPath(reqPath)
+	if err != nil {
+		return http.StatusForbidden, err
+	}
+	meta, err := op.GetNearestMeta(reqPath)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		return http.StatusInternalServerError, err
+	}
+	if !common.CanWrite(user, meta, reqPath) {
+		return http.StatusForbidden, errs.PermissionDenied
+	}
+
 	switch err = h.LockSystem.Unlock(time.Now(), t); err {
 	case nil:
 		return http.StatusNoContent, err
@@ -632,11 +744,19 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
 	}
 	ctx := r.Context()
 	userAgent := r.Header.Get("User-Agent")
-	ctx = context.WithValue(ctx, "userAgent", userAgent)
-	user := ctx.Value("user").(*model.User)
+	ctx = context.WithValue(ctx, conf.UserAgentKey, userAgent)
+	user := ctx.Value(conf.UserKey).(*model.User)
+	password, _ := ctx.Value(conf.MetaPassKey).(string)
 	reqPath, err = user.JoinPath(reqPath)
 	if err != nil {
-		return 403, err
+		return http.StatusForbidden, err
+	}
+	meta, err := op.GetNearestMeta(reqPath)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		return http.StatusInternalServerError, err
+	}
+	if !common.CanAccess(user, meta, reqPath, password) {
+		return http.StatusForbidden, errs.PermissionDenied
 	}
 	fi, err := fs.Get(ctx, reqPath, &fs.GetArgs{})
 	if err != nil {
@@ -712,10 +832,17 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request) (statu
 	defer release()
 
 	ctx := r.Context()
-	user := ctx.Value("user").(*model.User)
+	user := ctx.Value(conf.UserKey).(*model.User)
 	reqPath, err = user.JoinPath(reqPath)
 	if err != nil {
-		return 403, err
+		return http.StatusForbidden, err
+	}
+	meta, err := op.GetNearestMeta(reqPath)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		return http.StatusInternalServerError, err
+	}
+	if !common.CanWrite(user, meta, reqPath) {
+		return http.StatusForbidden, errs.PermissionDenied
 	}
 	if _, err := fs.Get(ctx, reqPath, &fs.GetArgs{}); err != nil {
 		if errs.IsObjectNotFound(err) {

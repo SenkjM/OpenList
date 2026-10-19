@@ -12,15 +12,15 @@ import (
 type TaskExtension struct {
 	tache.Base
 	Creator    *model.User
-	startTime  *time.Time
-	endTime    *time.Time
-	totalBytes int64
+	StartTime  *time.Time `json:"start_time,omitempty"`
+	EndTime    *time.Time `json:"end_time,omitempty"`
+	TotalBytes int64
 	ApiUrl     string
 }
 
 func (t *TaskExtension) SetCtx(ctx context.Context) {
 	if t.Creator != nil {
-		ctx = context.WithValue(ctx, "user", t.Creator)
+		ctx = context.WithValue(ctx, conf.UserKey, t.Creator)
 	}
 	if len(t.ApiUrl) > 0 {
 		ctx = context.WithValue(ctx, conf.ApiUrlKey, t.ApiUrl)
@@ -38,45 +38,45 @@ func (t *TaskExtension) GetCreator() *model.User {
 }
 
 func (t *TaskExtension) SetStartTime(startTime time.Time) {
-	t.startTime = &startTime
+	t.StartTime = &startTime
 }
 
 func (t *TaskExtension) GetStartTime() *time.Time {
-	return t.startTime
+	return t.StartTime
 }
 
 func (t *TaskExtension) SetEndTime(endTime time.Time) {
-	t.endTime = &endTime
+	t.EndTime = &endTime
 }
 
 func (t *TaskExtension) GetEndTime() *time.Time {
-	return t.endTime
+	return t.EndTime
 }
 
 func (t *TaskExtension) ClearEndTime() {
-	t.endTime = nil
+	t.EndTime = nil
 }
 
 func (t *TaskExtension) SetTotalBytes(totalBytes int64) {
-	t.totalBytes = totalBytes
+	t.TotalBytes = totalBytes
 }
 
 func (t *TaskExtension) GetTotalBytes() int64 {
-	return t.totalBytes
+	return t.TotalBytes
 }
 
-func (t *TaskExtension) ReinitCtx() error {
+func (t *TaskExtension) SetRetry(retry int, maxRetry int) {
+	t.Base.SetRetry(retry, maxRetry)
+	if retry > 0 || !conf.Conf.Tasks.AllowRetryCanceled || t.Ctx() == nil {
+		return
+	}
 	select {
 	case <-t.Ctx().Done():
-		if !conf.Conf.Tasks.AllowRetryCanceled {
-			return t.Ctx().Err()
-		}
 		ctx, cancel := context.WithCancel(context.Background())
 		t.SetCtx(ctx)
 		t.SetCancelFunc(cancel)
 	default:
 	}
-	return nil
 }
 
 type TaskExtensionInfo interface {

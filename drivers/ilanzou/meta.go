@@ -1,4 +1,4 @@
-package template
+package ilanzou
 
 import (
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
@@ -29,11 +29,13 @@ func init() {
 	op.RegisterDriver(func() driver.Driver {
 		return &ILanZou{
 			config: driver.Config{
-				Name:        "ILanZou",
-				DefaultRoot: "0",
+				Name:              "ILanZou",
+				DefaultRoot:       "0",
+				LocalSort:         true,
+				NoOverwriteUpload: true,
 			},
 			conf: Conf{
-				base:       "https://api.ilanzou.com",
+				base:       "https://apis.ilanzou.com",
 				secret:     []byte("lanZouY-disk-app"),
 				bucket:     "wpanstore-lanzou",
 				unproved:   "unproved",
@@ -46,8 +48,10 @@ func init() {
 	op.RegisterDriver(func() driver.Driver {
 		return &ILanZou{
 			config: driver.Config{
-				Name:        "FeijiPan",
-				DefaultRoot: "0",
+				Name:              "FeijiPan",
+				DefaultRoot:       "0",
+				LocalSort:         true,
+				NoOverwriteUpload: true,
 			},
 			conf: Conf{
 				base:       "https://api.feijipan.com",

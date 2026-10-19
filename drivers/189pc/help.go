@@ -9,6 +9,7 @@ import (
 	"crypto/sha1"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"encoding/xml"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils/random"
 )
 
@@ -80,6 +82,20 @@ func timestamp() int64 {
 	return time.Now().UTC().UnixNano() / 1e6
 }
 
+// formatDate formats a time.Time object into the "YYYY-MM-DDHH:mm:ssSSS" format.
+func formatDate(t time.Time) string {
+	// The layout string "2006-01-0215:04:05.000" corresponds to:
+	// 2006 -> Year (YYYY)
+	// 01   -> Month (MM)
+	// 02   -> Day (DD)
+	// 15   -> Hour (HH)
+	// 04   -> Minute (mm)
+	// 05   -> Second (ss)
+	// 000  -> Millisecond (SSS) with leading zeros
+	// Note the lack of a separator between the date and hour, matching the desired output.
+	return t.Format("2006-01-0215:04:05.000")
+}
+
 func MustParseTime(str string) *time.Time {
 	lastOpTime, _ := time.ParseInLocation("2006-01-02 15:04:05 -07", str+" +08", time.Local)
 	return &lastOpTime
@@ -87,7 +103,13 @@ func MustParseTime(str string) *time.Time {
 
 type Time time.Time
 
-func (t *Time) UnmarshalJSON(b []byte) error { return t.Unmarshal(b) }
+func (t *Time) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	return t.Unmarshal([]byte(s))
+}
 func (t *Time) UnmarshalXML(e *xml.Decoder, ee xml.StartElement) error {
 	b, err := e.Token()
 	if err != nil {
@@ -102,10 +124,19 @@ func (t *Time) UnmarshalXML(e *xml.Decoder, ee xml.StartElement) error {
 }
 func (t *Time) Unmarshal(b []byte) error {
 	bs := strings.Trim(string(b), "\"")
+	// 189 时间串里 AM/PM 前可能使用 U+202F 窄不换行空格或 U+00A0 不换行空格，统一替换为普通空格
+	bs = strings.ReplaceAll(bs, "\u202f", " ")
+	bs = strings.ReplaceAll(bs, "\u00a0", " ")
 	var v time.Time
 	var err error
-	for _, f := range []string{"2006-01-02 15:04:05 -07", "Jan 2, 2006 15:04:05 PM -07"} {
-		v, err = time.ParseInLocation(f, bs+" +08", time.Local)
+	// 189 返回的时间可能自带时区（如 "Aug 11, 2026, 10:37:18 PM +08"），也可能不带，分别尝试
+	for _, s := range []string{bs, bs + " +08"} {
+		for _, f := range []string{"2006-01-02 15:04:05 -07", "Jan 2, 2006 3:04:05 PM -07", "Jan 2, 2006, 3:04:05 PM -07"} {
+			v, err = time.ParseInLocation(f, s, utils.CNLoc)
+			if err == nil {
+				break
+			}
+		}
 		if err == nil {
 			break
 		}
