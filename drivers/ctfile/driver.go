@@ -141,19 +141,8 @@ func (d *CtFile) Rename(ctx context.Context, srcObj model.Obj, newName string) (
 // Copy copies srcObj into dstDir.
 // The spec explicitly requires implementation; the Worker's "unimplemented"
 // note is overridden here. The API endpoint is POST /{ns}/file/copy.
-func (d *CtFile) Copy(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
-	err := d.copyFiles(ctx, []string{srcObj.GetID()}, dstDir.GetID())
-	if err != nil {
-		return nil, err
-	}
-	// The API does not return the new item's ID, so we return a name-only object.
-	return &model.Object{
-		Name:     srcObj.GetName(),
-		Size:     srcObj.GetSize(),
-		IsFolder: srcObj.IsDir(),
-		Modified: srcObj.ModTime(),
-		Ctime:    srcObj.CreateTime(),
-	}, nil
+func (d *CtFile) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
+	return d.copyFiles(ctx, []string{srcObj.GetID()}, dstDir.GetID())
 }
 
 // Remove deletes obj (moves to trash).
@@ -254,7 +243,7 @@ var (
 	_ driver.MkdirResult = (*CtFile)(nil)
 	_ driver.MoveResult  = (*CtFile)(nil)
 	_ driver.RenameResult = (*CtFile)(nil)
-	_ driver.CopyResult  = (*CtFile)(nil)
+	_ driver.Copy        = (*CtFile)(nil)
 	_ driver.Remove      = (*CtFile)(nil)
 	_ driver.Put         = (*CtFile)(nil)
 )
