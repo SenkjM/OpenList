@@ -150,38 +150,37 @@ func (d *CtFile) Remove(ctx context.Context, obj model.Obj) error {
 	return d.remove(ctx, []string{obj.GetID()})
 }
 
-// Put uploads a file to dstDir. The entire file is buffered to compute the
-// MD5-based checksum required by the CtFile upload API.
+// Put uploads a file to dstDir. The stream is cached so the checksum and the
+// subsequent multipart upload can reuse it without keeping the entire file in memory.
 func (d *CtFile) Put(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) error {
-	// Obtain MD5 from pre-computed hash if available; otherwise cache the stream.
 	md5hex := file.GetHash().GetHash(utils.MD5)
-	var content []byte
+	tmpFile := file.GetFile()
+	var err error
 
 	if len(md5hex) != utils.MD5.Width {
 		// Cache the full stream and compute MD5 simultaneously.
-		tmpFile, hash, err := stream.CacheFullAndHash(file, &up, utils.MD5)
+		tmpFile, md5hex, err = stream.CacheFullAndHash(file, &up, utils.MD5)
+	} else if tmpFile == nil {
+		// A pre-computed MD5 still needs a seekable source for the upload.
+		tmpFile, err = file.CacheFullAndWriter(&up, nil)
+	}
+	if err != nil {
+		return err
+	}
+	if tmpFile == nil {
+		return fmt.Errorf("[CtFile] failed to cache upload stream")
+	}
+	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	size := file.GetSize()
+	if size < 0 {
+		size, err = tmpFile.Seek(0, io.SeekEnd)
 		if err != nil {
 			return err
 		}
-		md5hex = hash
-		if tmpFile != nil {
-			// model.File implements io.ReadSeeker; seek to the start, then read all.
-			if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
-				return err
-			}
-			content, err = io.ReadAll(tmpFile)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	// If CacheFullAndHash returned nil tmpFile (e.g. file was already cached),
-	// fall back to reading directly from the FileStreamer.
-	if content == nil {
-		var err error
-		content, err = io.ReadAll(file)
-		if err != nil {
+		if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
 			return err
 		}
 	}
@@ -191,7 +190,7 @@ func (d *CtFile) Put(ctx context.Context, dstDir model.Obj, file model.FileStrea
 	}
 
 	parentID := dstDir.GetID()
-	err := d.uploadFile(ctx, parentID, file.GetName(), content)
+	err = d.uploadFile(ctx, parentID, file.GetName(), tmpFile, size, md5hex)
 	if err != nil {
 		return err
 	}

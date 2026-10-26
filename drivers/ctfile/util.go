@@ -3,7 +3,6 @@ package ctfile
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -402,22 +401,20 @@ func (d *CtFile) copyFiles(ctx context.Context, ids []string, targetFolderID str
 	return err
 }
 
-// uploadFile uploads bytes to CtFile using the two-step ticket+multipart flow.
+// uploadFile uploads a stream to CtFile using the two-step ticket+multipart flow.
 // checksum format: md5hex + "-" + size
-func (d *CtFile) uploadFile(ctx context.Context, folderID, fileName string, content []byte) error {
+func (d *CtFile) uploadFile(ctx context.Context, folderID, fileName string, content io.Reader, size int64, md5hex string) error {
 	if folderID == "" || folderID == "0" {
 		folderID = rootFolderID
 	}
 
-	// Compute MD5-based checksum
-	sum := md5.Sum(content)
-	checksum := fmt.Sprintf("%x-%d", sum, len(content))
+	checksum := fmt.Sprintf("%s-%d", md5hex, size)
 
 	// Step 1: get upload ticket
 	result, err := d.call(ctx, "/"+d.ns()+"/file/upload", map[string]any{
 		"folder_id": folderID,
 		"checksum":  checksum,
-		"size":      len(content),
+		"size":      size,
 		"name":      fileName,
 	})
 	if err != nil {
@@ -436,40 +433,81 @@ func (d *CtFile) uploadFile(ctx context.Context, folderID, fileName string, cont
 	}
 
 	// Step 2: multipart upload to the presigned URL
-	return d.multipartUpload(ctx, uploadURL, fileName, content)
+	return d.multipartUpload(ctx, uploadURL, fileName, content, size)
 }
 
-// multipartUpload POSTs name+filesize+file to a presigned upload URL.
-func (d *CtFile) multipartUpload(ctx context.Context, uploadURL, fileName string, content []byte) error {
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
+// countingWriter counts bytes without retaining the written data.
+type countingWriter int64
 
+func (w *countingWriter) Write(p []byte) (int, error) {
+	*w += countingWriter(len(p))
+	return len(p), nil
+}
+
+func writeMultipartFields(mw *multipart.Writer, fileName string, size int64) (io.Writer, error) {
 	if err := mw.WriteField("name", fileName); err != nil {
-		return err
+		return nil, err
 	}
-	if err := mw.WriteField("filesize", strconv.Itoa(len(content))); err != nil {
-		return err
+	if err := mw.WriteField("filesize", strconv.FormatInt(size, 10)); err != nil {
+		return nil, err
 	}
-	fw, err := mw.CreateFormFile("file", fileName)
-	if err != nil {
-		return err
-	}
-	if _, err := fw.Write(content); err != nil {
-		return err
+	return mw.CreateFormFile("file", fileName)
+}
+
+func multipartLayout(fileName string, size int64) (int64, string, error) {
+	var count countingWriter
+	mw := multipart.NewWriter(&count)
+	if _, err := writeMultipartFields(mw, fileName, size); err != nil {
+		return 0, "", err
 	}
 	if err := mw.Close(); err != nil {
-		return err
+		return 0, "", err
 	}
+	return int64(count) + size, mw.Boundary(), nil
+}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, &buf)
+// multipartUpload POSTs name+filesize+file to a presigned upload URL without
+// retaining the complete multipart body in memory.
+func (d *CtFile) multipartUpload(ctx context.Context, uploadURL, fileName string, content io.Reader, size int64) error {
+	contentLength, boundary, err := multipartLayout(fileName, size)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", mw.FormDataContentType())
+
+	pr, pw := io.Pipe()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, pr)
+	if err != nil {
+		return err
+	}
+	req.ContentLength = contentLength
+	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
 	req.Header.Set("User-Agent", d.ua())
+
+	go func() {
+		mw := multipart.NewWriter(pw)
+		if err := mw.SetBoundary(boundary); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		fw, err := writeMultipartFields(mw, fileName, size)
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if _, err := io.Copy(fw, content); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if err := mw.Close(); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		_ = pw.Close()
+	}()
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		_ = pr.CloseWithError(err)
 		return err
 	}
 	defer resp.Body.Close()
