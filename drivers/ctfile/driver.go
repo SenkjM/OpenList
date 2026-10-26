@@ -156,13 +156,17 @@ func (d *CtFile) Put(ctx context.Context, dstDir model.Obj, file model.FileStrea
 	md5hex := file.GetHash().GetHash(utils.MD5)
 	tmpFile := file.GetFile()
 	var err error
+	var cacheProgress *model.UpdateProgress
+	if up != nil {
+		cacheProgress = &up
+	}
 
 	if len(md5hex) != utils.MD5.Width {
 		// Cache the full stream and compute MD5 simultaneously.
-		tmpFile, md5hex, err = stream.CacheFullAndHash(file, &up, utils.MD5)
+		tmpFile, md5hex, err = stream.CacheFullAndHash(file, cacheProgress, utils.MD5)
 	} else if tmpFile == nil {
 		// A pre-computed MD5 still needs a seekable source for the upload.
-		tmpFile, err = file.CacheFullAndWriter(&up, nil)
+		tmpFile, err = file.CacheFullAndWriter(cacheProgress, nil)
 	}
 	if err != nil {
 		return err
